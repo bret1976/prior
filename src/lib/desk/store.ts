@@ -182,8 +182,30 @@ export async function approve(jobId: string, approver: string) {
   if (!fit) return { error: "Hold no longer fits policy.", status: 422 as const };
   if (fit.depositUsd > job.capUsd || fit.spendUsd > job.capUsd) return { error: "Cap blocks this charge.", status: 422 as const };
   const charge = await chargeDeposit({ amountUsd: fit.depositUsd, jobId, venue: fit.name });
-  if (!charge.ok) return { error: charge.error, status: 402 as const };
-  return { error: "Charge did not settle.", status: 402 as const };
+  if (!charge.ok) {
+    return {
+      error: charge.error,
+      status: 402 as const,
+      checkoutUrl: "checkoutUrl" in charge ? charge.checkoutUrl : undefined,
+      sessionId: "sessionId" in charge ? charge.sessionId : undefined,
+    };
+  }
+  const slots = await sql<{ label: string }>`select label from slots where id = ${job.hold.slotId}`;
+  await sql`update slots set left_count = left_count - 1 where id = ${job.hold.slotId} and left_count > 0`;
+  const receipt = {
+    id: charge.sessionId,
+    principal: job.principal,
+    venue: fit.name,
+    slot: slots[0]?.label ?? job.hold.slotId,
+    party: job.request.party,
+    spendUsd: fit.spendUsd,
+    depositUsd: charge.amountUsd ?? fit.depositUsd,
+    cancelByHours: fit.cancelHours,
+    approver,
+  };
+  await sql`update jobs set status = 'confirmed', hold = null, receipt = ${JSON.stringify(receipt)}::jsonb where id = ${jobId}`;
+  await push(sql, jobId, "charge", `Stripe collected $${receipt.depositUsd} for ${fit.name}.`);
+  return { job: await loadJob(sql, jobId) };
 }
 
 export async function changeJob(jobId: string, slotId: string) {

@@ -1,4 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { openCheckout, paidCheckout } from "@/lib/desk/pay";
 import { judge } from "@/lib/prior/engine";
 import { decide, listDecisions, publishedPolicy, spentToday } from "@/lib/prior/store";
 
@@ -29,14 +30,45 @@ function str(value: unknown, fallback = "") {
 export const Route = createFileRoute("/api/v1/$")({
   server: {
     handlers: {
-      GET: async ({ params }) => dispatch("GET", params._splat ?? "", null),
-      POST: async ({ request, params }) => dispatch("POST", params._splat ?? "", await readBody(request)),
+      GET: async ({ request, params }) => dispatch("GET", params._splat ?? "", null, request),
+      POST: async ({ request, params }) => dispatch("POST", params._splat ?? "", await readBody(request), request),
     },
   },
 });
 
-async function dispatch(method: string, splat: string, body: Record<string, unknown> | null) {
+async function dispatch(method: string, splat: string, body: Record<string, unknown> | null, request: Request) {
   const parts = splat.split("/").filter(Boolean);
+  const origin = new URL(request.url).origin;
+
+  if (method === "GET" && parts[0] === "checkout" && parts[1] === "return") {
+    const sessionId = new URL(request.url).searchParams.get("session_id") ?? "";
+    const paid = await paidCheckout(sessionId);
+    return json(paid, paid.collected ? 200 : 402);
+  }
+
+  if (method === "GET" && parts[0] === "checkout" && parts[1]) {
+    const paid = await paidCheckout(parts[1]);
+    return json(paid, paid.collected ? 200 : 402);
+  }
+
+  if (method === "POST" && parts[0] === "checkout" && body) {
+    const amountUsd = num(body.amountUsd, 1);
+    const opened = await openCheckout({
+      amountUsd,
+      description: str(body.description, "Prior"),
+      successUrl: `${origin}/api/v1/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
+      cancelUrl: `${origin}/`,
+    });
+    if (!opened.ok) return json({ error: opened.error }, 402);
+    return json({
+      collected: false,
+      sessionId: opened.sessionId,
+      url: opened.url,
+      amountUsd: opened.amountUsd,
+      confirm: `/api/v1/checkout/${opened.sessionId}`,
+    });
+  }
+
   const policy = await publishedPolicy();
 
   if (method === "GET" && (parts[0] === "manifest" || parts[0] === "agent")) {
@@ -51,8 +83,10 @@ async function dispatch(method: string, splat: string, body: Record<string, unkn
       description: "A spend gate other agents call before money moves. The rules are already published. Over the line is denied. Nobody is asked to approve it.",
       find: "/api/v1/manifest",
       use: "POST /api/v1/decide",
-      priceUsd: 0,
-      charge: "none",
+      buy: "POST /api/v1/checkout",
+      confirm: "GET /api/v1/checkout/{sessionId}",
+      priceUsd: 1,
+      charge: "Checkout. Money is collected only after Stripe reports the session paid.",
       policy,
       spentTodayUsd: spent,
       samples,

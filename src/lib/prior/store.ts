@@ -2,6 +2,43 @@ import { randomBytes } from "node:crypto";
 import { getSql } from "@/lib/db";
 import { judge, type Policy, type Verdict } from "./engine";
 
+const FIXED: Policy = {
+  id: "pol-prior",
+  name: "Prior",
+  maxSingleUsd: 250,
+  maxDailyUsd: 1000,
+  approvalAboveUsd: 100,
+  blockedCategories: ["gambling", "gift cards"],
+  allowedVendors: [],
+};
+
+type MemoryDecision = {
+  id: string;
+  policyId: string;
+  agent: string;
+  vendor: string;
+  category: string;
+  amountUsd: number;
+  spentTodayUsd: number;
+  verdict: Verdict;
+  reasons: string[];
+  createdAt: string;
+};
+
+const memoryDecisions: MemoryDecision[] = [];
+const memoryIdem = new Map<string, { decision: MemoryDecision }>();
+
+function onVercelWithoutDatabase() {
+  return Boolean(process.env.VERCEL) && !process.env.DATABASE_URL?.trim();
+}
+
+function memorySpent(policyId: string) {
+  const day = new Date().toISOString().slice(0, 10);
+  return memoryDecisions
+    .filter((row) => row.policyId === policyId && row.verdict === "allow" && row.createdAt.slice(0, 10) === day)
+    .reduce((sum, row) => sum + row.amountUsd, 0);
+}
+
 type PolicyRow = {
   id: string;
   name: string;
@@ -38,6 +75,7 @@ function toPolicy(row: PolicyRow): Policy {
 }
 
 export async function publishedPolicy() {
+  if (onVercelWithoutDatabase()) return FIXED;
   const sql = await getSql();
   const id = "pol-prior";
   const existing = await sql<PolicyRow>`select id, name, max_single_usd, max_daily_usd, approval_above_usd, blocked_categories, allowed_vendors from policies where id = ${id}`;
@@ -80,6 +118,7 @@ export async function getPolicy(id: string) {
 }
 
 export async function spentToday(policyId: string) {
+  if (onVercelWithoutDatabase()) return memorySpent(policyId);
   const sql = await getSql();
   const rows = await sql<{ total: number }>`select coalesce(sum(amount_usd), 0) as total from decisions where policy_id = ${policyId} and verdict = 'allow' and created_at::date = current_date`;
   return Number(rows[0]?.total ?? 0);
@@ -100,6 +139,34 @@ export async function decide(input: {
   }
   if (!Number.isInteger(input.amountUsd)) {
     return { error: "Amount must be a whole number of dollars.", status: 422 as const };
+  }
+  if (onVercelWithoutDatabase()) {
+    const idem = input.idempotencyKey?.trim();
+    if (idem && memoryIdem.has(`decide:${idem}`)) return memoryIdem.get(`decide:${idem}`)!;
+    const spent = memorySpent(policy.id);
+    const judged = judge({
+      policy,
+      amountUsd: input.amountUsd,
+      vendor: input.vendor,
+      category: input.category,
+      spentTodayUsd: spent,
+    });
+    const decision: MemoryDecision = {
+      id: `dec-${randomBytes(4).toString("hex")}`,
+      policyId: policy.id,
+      agent: input.agent,
+      vendor: input.vendor,
+      category: input.category,
+      amountUsd: input.amountUsd,
+      spentTodayUsd: spent,
+      verdict: judged.verdict,
+      reasons: judged.reasons,
+      createdAt: new Date().toISOString(),
+    };
+    memoryDecisions.unshift(decision);
+    const body = { decision };
+    if (idem) memoryIdem.set(`decide:${idem}`, body);
+    return body;
   }
   const sql = await getSql();
   const idem = input.idempotencyKey?.trim();
@@ -144,6 +211,21 @@ async function freshDecision(
 }
 
 export async function listDecisions(policyId: string) {
+  if (onVercelWithoutDatabase()) {
+    return memoryDecisions
+      .filter((row) => row.policyId === policyId)
+      .slice(0, 40)
+      .map((row) => ({
+        id: row.id,
+        agent: row.agent,
+        vendor: row.vendor,
+        category: row.category,
+        amount_usd: row.amountUsd,
+        verdict: row.verdict,
+        reasons: row.reasons,
+        created_at: row.createdAt,
+      }));
+  }
   const sql = await getSql();
   return sql<{
     id: string;
