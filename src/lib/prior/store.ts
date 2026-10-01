@@ -112,6 +112,7 @@ export async function listPolicies() {
 }
 
 export async function getPolicy(id: string) {
+  if (onVercelWithoutDatabase()) return id === FIXED.id ? FIXED : null;
   const sql = await getSql();
   const rows = await sql<PolicyRow>`select id, name, max_single_usd, max_daily_usd, approval_above_usd, blocked_categories, allowed_vendors from policies where id = ${id}`;
   return rows[0] ? toPolicy(rows[0]) : null;
