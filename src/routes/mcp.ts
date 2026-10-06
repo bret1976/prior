@@ -1,5 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { openCheckout, paidCheckout } from "@/lib/desk/pay";
+import {
+  GUARD_VERSION,
+  checkCheckoutRate,
+  checkConfirmRate,
+  checkDecideRate,
+  checkoutAmountError,
+  cleanDescription,
+  clientIp,
+} from "@/lib/prior/guard";
 import { decide } from "@/lib/prior/store";
 
 const PROTOCOL = "2025-06-18";
@@ -97,7 +106,7 @@ export const Route = createFileRoute("/mcp")({
           const params = message.params ?? {};
           const name = typeof params.name === "string" ? params.name : "";
           const args = (params.arguments ?? {}) as Record<string, unknown>;
-          const text = await callTool(name, args, new URL(request.url).origin);
+          const text = await callTool(name, args, new URL(request.url).origin, clientIp(request));
           return rpc(id, { content: [{ type: "text", text }], isError: text.startsWith("Error:") });
         }
         return fail(id, -32601, `Unknown method ${method}`);
@@ -106,8 +115,10 @@ export const Route = createFileRoute("/mcp")({
   },
 });
 
-async function callTool(name: string, args: Record<string, unknown>, origin: string) {
+async function callTool(name: string, args: Record<string, unknown>, origin: string, ip = "unknown") {
   if (name === "decide") {
+    const limited = checkDecideRate(ip);
+    if (limited.blocked) return `Error: ${limited.error}`;
     const amount = typeof args.amountUsd === "number" ? args.amountUsd : Number(args.amountUsd);
     const result = await decide({
       policyId: "pol-prior",
@@ -121,15 +132,23 @@ async function callTool(name: string, args: Record<string, unknown>, origin: str
   }
   if (name === "buy") {
     const amount = typeof args.amountUsd === "number" ? args.amountUsd : Number(args.amountUsd);
+    const amountUsd = Number.isFinite(amount) && amount > 0 ? amount : 1;
+    const overCap = checkoutAmountError(amountUsd);
+    if (overCap) return JSON.stringify({ ok: false, error: overCap });
+    const limited = checkCheckoutRate(ip);
+    if (limited.blocked) return `Error: ${limited.error}`;
     const opened = await openCheckout({
-      amountUsd: Number.isFinite(amount) && amount > 0 ? amount : 1,
-      description: typeof args.description === "string" ? args.description : "Prior",
+      amountUsd,
+      description: cleanDescription(args.description, "Prior"),
       successUrl: `${origin}/api/v1/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
       cancelUrl: `${origin}/`,
+      metadata: { app: "prior", source: "mcp", guard: GUARD_VERSION },
     });
     return JSON.stringify(opened);
   }
   if (name === "confirm_payment") {
+    const limited = checkConfirmRate(ip);
+    if (limited.blocked) return `Error: ${limited.error}`;
     const sessionId = typeof args.sessionId === "string" ? args.sessionId : "";
     return JSON.stringify(await paidCheckout(sessionId));
   }

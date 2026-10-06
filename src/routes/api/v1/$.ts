@@ -1,13 +1,27 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { openCheckout, paidCheckout } from "@/lib/desk/pay";
+import { openCheckout, paidCheckout, stripeConfigured } from "@/lib/desk/pay";
 import { judge } from "@/lib/prior/engine";
+import {
+  GUARD_VERSION,
+  checkCheckoutRate,
+  checkConfirmRate,
+  checkDecideRate,
+  checkoutAmountError,
+  cleanDescription,
+  clientIp,
+  guardSummary,
+} from "@/lib/prior/guard";
 import { decide, listDecisions, publishedPolicy, spentToday } from "@/lib/prior/store";
 
-function json(body: unknown, status = 200) {
+function json(body: unknown, status = 200, extra?: Record<string, string>) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(extra ?? {}) },
   });
+}
+
+function tooMany(block: { error: string; retryAfterSec: number }) {
+  return json({ error: block.error }, 429, { "retry-after": String(block.retryAfterSec) });
 }
 
 async function readBody(request: Request) {
@@ -39,6 +53,17 @@ export const Route = createFileRoute("/api/v1/$")({
 async function dispatch(method: string, splat: string, body: Record<string, unknown> | null, request: Request) {
   const parts = splat.split("/").filter(Boolean);
   const origin = new URL(request.url).origin;
+  const ip = clientIp(request);
+
+  // checkout-guard-v1: additive health endpoint (was 404 before).
+  if (method === "GET" && parts[0] === "health" && parts.length === 1) {
+    return json({ ok: true, app: "prior", packs: { checkout_guard: GUARD_VERSION }, stripeConfigured: stripeConfigured(), guard: guardSummary() });
+  }
+
+  if (method === "GET" && parts[0] === "checkout" && parts[1]) {
+    const limited = checkConfirmRate(ip);
+    if (limited.blocked) return tooMany(limited);
+  }
 
   if (method === "GET" && parts[0] === "checkout" && parts[1] === "return") {
     const sessionId = new URL(request.url).searchParams.get("session_id") ?? "";
@@ -53,11 +78,16 @@ async function dispatch(method: string, splat: string, body: Record<string, unkn
 
   if (method === "POST" && parts[0] === "checkout" && body) {
     const amountUsd = num(body.amountUsd, 1);
+    const overCap = checkoutAmountError(amountUsd);
+    if (overCap) return json({ error: overCap }, 402);
+    const limited = checkCheckoutRate(ip);
+    if (limited.blocked) return tooMany(limited);
     const opened = await openCheckout({
       amountUsd,
-      description: str(body.description, "Prior"),
+      description: cleanDescription(body.description, "Prior"),
       successUrl: `${origin}/api/v1/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
       cancelUrl: `${origin}/`,
+      metadata: { app: "prior", source: "api", guard: GUARD_VERSION },
     });
     if (!opened.ok) return json({ error: opened.error }, 402);
     return json({
@@ -99,6 +129,8 @@ async function dispatch(method: string, splat: string, body: Record<string, unkn
   }
 
   if (method === "POST" && parts[0] === "decide" && body) {
+    const limited = checkDecideRate(ip);
+    if (limited.blocked) return tooMany(limited);
     const result = await decide({
       policyId: policy.id,
       amountUsd: num(body.amountUsd, 0),

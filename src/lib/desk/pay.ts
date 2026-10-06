@@ -1,3 +1,5 @@
+import { validSessionId } from "@/lib/prior/guard";
+
 function key() {
   const value = process.env.STRIPE_SECRET_KEY?.trim();
   return value || null;
@@ -29,6 +31,7 @@ export async function openCheckout(input: {
   description: string;
   successUrl: string;
   cancelUrl: string;
+  metadata?: Record<string, string>;
 }) {
   const cents = Math.round(input.amountUsd * 100);
   if (!Number.isInteger(cents) || cents < 50) {
@@ -42,6 +45,7 @@ export async function openCheckout(input: {
   body.set("line_items[0][price_data][currency]", "usd");
   body.set("line_items[0][price_data][unit_amount]", String(cents));
   body.set("line_items[0][price_data][product_data][name]", input.description.slice(0, 120));
+  for (const [k, v] of Object.entries(input.metadata ?? {})) body.set(`metadata[${k}]`, v.slice(0, 500));
   const res = await stripe("checkout/sessions", body);
   const url = res.data.url;
   const id = res.data.id;
@@ -52,7 +56,7 @@ export async function openCheckout(input: {
 }
 
 export async function paidCheckout(sessionId: string) {
-  if (!sessionId.startsWith("cs_")) return { collected: false as const, error: "That is not a Stripe checkout session." };
+  if (!validSessionId(sessionId)) return { collected: false as const, error: "That is not a Stripe checkout session." };
   const res = await stripe(`checkout/sessions/${encodeURIComponent(sessionId)}`);
   if (!res.ok) return { collected: false as const, error: res.data.error?.message || "Stripe could not read that session." };
   const collected = res.data.payment_status === "paid";

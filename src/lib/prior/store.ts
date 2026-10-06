@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { getSql } from "@/lib/db";
 import { judge, type Policy, type Verdict } from "./engine";
+import { decideFieldError, guardEnabled } from "./guard";
 
 const FIXED: Policy = {
   id: "pol-prior",
@@ -27,6 +28,33 @@ type MemoryDecision = {
 
 const memoryDecisions: MemoryDecision[] = [];
 const memoryIdem = new Map<string, { decision: MemoryDecision }>();
+// checkout-guard-v1: the in-memory (Vercel, no DATABASE_URL) path used to grow
+// forever and re-sum the whole list on every call. Keep a running per-day
+// allow total so trimming history can never under-count today's spend.
+const MEMORY_DECISIONS_MAX = 1000;
+const MEMORY_IDEM_MAX = 2000;
+const memoryAllowedByDay = new Map<string, number>();
+
+function rememberDecision(decision: MemoryDecision) {
+  memoryDecisions.unshift(decision);
+  if (decision.verdict === "allow") {
+    const k = `${decision.policyId}:${decision.createdAt.slice(0, 10)}`;
+    memoryAllowedByDay.set(k, (memoryAllowedByDay.get(k) ?? 0) + decision.amountUsd);
+    if (memoryAllowedByDay.size > 64) {
+      const oldest = memoryAllowedByDay.keys().next().value;
+      if (oldest !== undefined && oldest !== k) memoryAllowedByDay.delete(oldest);
+    }
+  }
+  if (guardEnabled() && memoryDecisions.length > MEMORY_DECISIONS_MAX) memoryDecisions.length = MEMORY_DECISIONS_MAX;
+}
+
+function rememberIdem(key: string, body: { decision: MemoryDecision }) {
+  memoryIdem.set(key, body);
+  if (guardEnabled() && memoryIdem.size > MEMORY_IDEM_MAX) {
+    const oldest = memoryIdem.keys().next().value;
+    if (oldest !== undefined) memoryIdem.delete(oldest);
+  }
+}
 
 function onVercelWithoutDatabase() {
   return Boolean(process.env.VERCEL) && !process.env.DATABASE_URL?.trim();
@@ -34,9 +62,7 @@ function onVercelWithoutDatabase() {
 
 function memorySpent(policyId: string) {
   const day = new Date().toISOString().slice(0, 10);
-  return memoryDecisions
-    .filter((row) => row.policyId === policyId && row.verdict === "allow" && row.createdAt.slice(0, 10) === day)
-    .reduce((sum, row) => sum + row.amountUsd, 0);
+  return memoryAllowedByDay.get(`${policyId}:${day}`) ?? 0;
 }
 
 type PolicyRow = {
@@ -141,6 +167,8 @@ export async function decide(input: {
   if (!Number.isInteger(input.amountUsd)) {
     return { error: "Amount must be a whole number of dollars.", status: 422 as const };
   }
+  const tooLong = decideFieldError(input);
+  if (tooLong) return { error: tooLong, status: 422 as const };
   if (onVercelWithoutDatabase()) {
     const idem = input.idempotencyKey?.trim();
     if (idem && memoryIdem.has(`decide:${idem}`)) return memoryIdem.get(`decide:${idem}`)!;
@@ -164,9 +192,9 @@ export async function decide(input: {
       reasons: judged.reasons,
       createdAt: new Date().toISOString(),
     };
-    memoryDecisions.unshift(decision);
+    rememberDecision(decision);
     const body = { decision };
-    if (idem) memoryIdem.set(`decide:${idem}`, body);
+    if (idem) rememberIdem(`decide:${idem}`, body);
     return body;
   }
   const sql = await getSql();
