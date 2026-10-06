@@ -28,8 +28,8 @@ type MemoryDecision = {
 
 const memoryDecisions: MemoryDecision[] = [];
 const memoryIdem = new Map<string, { decision: MemoryDecision }>();
-// checkout-guard-v1: the in-memory (Vercel, no DATABASE_URL) path used to grow
-// forever and re-sum the whole list on every call. Keep a running per-day
+// checkout-guard-v1: the in-memory (Vercel, no DATABASE_URL) path kept every decision
+// with no bound and re-summed the whole list on every call. Keep a running per-day
 // allow total so trimming history can never under-count today's spend.
 const MEMORY_DECISIONS_MAX = 1000;
 const MEMORY_IDEM_MAX = 2000;
